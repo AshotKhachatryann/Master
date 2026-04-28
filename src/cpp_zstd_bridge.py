@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
 Bridge to use a C++ Zstd codec binary from Python.
 
@@ -101,9 +101,10 @@ class ZstdCompressor:
 
         try:
             cmd = [str(self.binary_path), mode, str(input_path), str(output_path)]
-            # Pass compression level only when compressing.
+            # Pass compression level only when compressing, via the
+            # CLI's -l flag (positional level arg is no longer accepted).
             if mode == "c":
-                cmd.append(str(effective_level))
+                cmd.extend(["-l", str(effective_level)])
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 raise RuntimeError(
@@ -118,7 +119,7 @@ class ZstdCompressor:
     def compress(self, data: bytes, level: int | None = None) -> bytes:
         """Compress raw bytes using Zstd.
 
-        If *level* is given it overrides the instance default for this
+        If *level* is given, it overrides the instance default for this
         call only (valid range: 1-22).
         """
         return self._run_codec("c", data, level)
@@ -126,3 +127,4 @@ class ZstdCompressor:
     def decompress(self, data: bytes) -> bytes:
         """Decompress a Zstd-compressed byte buffer back to the original data."""
         return self._run_codec("d", data)
+
