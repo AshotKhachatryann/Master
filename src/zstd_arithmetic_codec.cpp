@@ -16,6 +16,7 @@
  */
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -449,37 +450,138 @@ void writeAllBytes(const std::string& path, const std::vector<uint8_t>& data) {
  *   1. Read raw file into memory
  *   2. Stage 1: Zstd compress    →  compact byte buffer
  *   3. Stage 2: Arithmetic encode  →  final compressed output
- *   4. Write to output file
+ *   4. Write to the output file
  *
  * Decompress path (mode "d") — reverses the pipeline:
  *   1. Read compressed file
  *   2. Stage 1: Arithmetic decode  →  zstd-compressed buffer
  *   3. Stage 2: Zstd decompress  →  original raw bytes
- *   4. Write to output file
+ *   4. Write to the output file
  */
-int main(int argc, char* argv[]) {
-  if (argc < 4 || argc > 5) {
+namespace {
+
+/// Default file extension used for Zstd→Arithmetic compressed output.
+constexpr const char* ZAC_EXTENSION = ".zac";
+
+/// Returns true if *path* ends with the given suffix (case-sensitive).
+bool endsWith(const std::string& path, const std::string& suffix) {
+  return path.size() >= suffix.size() &&
+       path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+/// Derives the default compressed-output path by appending ".zac" to *input*.
+std::string defaultCompressedPath(const std::string& input) {
+  return input + ZAC_EXTENSION;
+}
+
+/// Derives the default decompressed-output path by stripping ".zac" from
+/// *input*.  If the input does not end in ".zac", appends ".out" instead so
+/// the result is never the same as the input file.
+std::string defaultDecompressedPath(const std::string& input) {
+  if (endsWith(input, ZAC_EXTENSION)) {
+    return input.substr(0, input.size() - std::string(ZAC_EXTENSION).size());
+  }
+  return input + ".out";
+}
+
+/// Renders *bytes* using the largest 1024-based unit that yields a value
+/// >= 1 (GB → MB → KB → B).  Two decimals for non-byte units.
+std::string formatSize(uint64_t bytes) {
+  constexpr uint64_t KB = 1024ULL;
+  constexpr uint64_t MB = KB * 1024ULL;
+  constexpr uint64_t GB = MB * 1024ULL;
+  char buf[32];
+  if (bytes >= GB) {
+    std::snprintf(buf, sizeof(buf), "%.2f GB", static_cast<double>(bytes) / GB);
+  } else if (bytes >= MB) {
+    std::snprintf(buf, sizeof(buf), "%.2f MB", static_cast<double>(bytes) / MB);
+  } else if (bytes >= KB) {
+    std::snprintf(buf, sizeof(buf), "%.2f KB", static_cast<double>(bytes) / KB);
+  } else {
+    std::snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
+  }
+  return std::string(buf);
+}
+
+}  // namespace
+
+int main(int argc, char* argv[])
+{
+  // Pre-pass: extract -l/--level flag (with optional '=' form) from argv,
+  // leaving only positional args for the legacy parser below.  The flag
+  // may appear anywhere on the command line.
+  int zstdLevel = 3;
+  std::vector<std::string> args;
+  args.reserve(argc);
+  args.emplace_back(argv[0]);
+
+  auto setLevel = [&](const std::string& v) -> bool {
+    try {
+      zstdLevel = std::stoi(v);
+    } catch (...) {
+      std::cerr << "Invalid zstdLevel value: '" << v << "'\n";
+      return false;
+    }
+    if (zstdLevel < 1 || zstdLevel > 22) {
+      std::cerr << "Invalid zstdLevel: " << zstdLevel << " (must be 1–22)\n";
+      return false;
+    }
+    return true;
+  }
+ for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "-l" || a == "--level") {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value for " << a << "\n";
+        return 1;
+      }
+      if (!setLevel(argv[++i])) return 1;
+    } else if (a.rfind("-l=", 0) == 0) {
+      if (!setLevel(a.substr(3))) return 1;
+    } else if (a.rfind("--level=", 0) == 0) {
+      if (!setLevel(a.substr(8))) return 1;
+    } else {
+      args.push_back(std::move(a));
+    }
+  }
+
+  // Positional contract after flag stripping:
+  //   args = [argv0, mode, input]            — output defaulted
+  //   args = [argv0, mode, input, output]    — explicit output
+  if (args.size() < 3 || args.size() > 4) {
     std::cerr << "Zstd+Arith two-stage pipeline codec\n\n"
           << "Usage:\n"
-          << "  " << argv[0] << " <mode> <input> <output> [zstdLevel]\n\n"
+          << "  " << argv[0] << " <mode> <input> [output] [-l N | --level N]\n\n"
           << "Modes:\n"
           << "  c, -c, -compress    Compress (Zstd → Arithmetic)\n"
           << "  d, -d, -decompress  Decompress (Arithmetic decode → Zstd)\n\n"
+          << "If [output] is omitted:\n"
+          << "  - compress writes to <input>.zac\n"
+          << "  - decompress strips the trailing .zac (or appends .out)\n\n"
+          << "-l, --level: Zstd level 1 (fastest) to 22 (best ratio), default 3.\n"
+          << "             Accepts '-l 9', '-l=9', '--level 9', or '--level=9'.\n\n"
           << "Compress:   input → Zstd → Arithmetic → output\n"
           << "Decompress: input → Arithmetic decode → Zstd decompress → output\n";
     return 1;
   }
 
-  const std::string mode    = argv[1];
-  const std::string inputFile  = argv[2];
-  const std::string outputFile = argv[3];
-  int zstdLevel = 3;
-  if (argc == 5) zstdLevel = std::stoi(argv[4]);
+  const std::string mode    = args[1];
+  const std::string inputFile  = args[2];
 
   // Normalize mode flag: accept c, -c, -compress for compression
   //             and  d, -d, -decompress for decompression
   const bool doCompress   = (mode == "c" || mode == "-c" || mode == "-compress");
   const bool doDecompress = (mode == "d" || mode == "-d" || mode == "-decompress");
+
+  // Resolve output path: explicit arg wins, otherwise use the mode default.
+  std::string outputFile;
+  if (args.size() == 4) {
+    outputFile = args[3];
+  } else if (doCompress) {
+    outputFile = defaultCompressedPath(inputFile);
+  } else if (doDecompress) {
+    outputFile = defaultDecompressedPath(inputFile);
+  }
 
   try {
     std::vector<uint8_t> input = readAllBytes(inputFile);
@@ -488,16 +590,17 @@ int main(int argc, char* argv[]) {
       // Stage 1: Zstd compress
       std::vector<uint8_t> zstdBytes = compressZstd(input, zstdLevel);
       std::cerr << "  Stage 1 (Zstd L" << zstdLevel << "): "
-            << input.size() << " -> " << zstdBytes.size() << " bytes\n";
+            << formatSize(input.size()) << " -> " << formatSize(zstdBytes.size()) << "\n";
 
       // Stage 2: Arithmetic encode
       std::vector<uint8_t> finalBytes = arithmeticEncode(zstdBytes);
       std::cerr << "  Stage 2 (Arithmetic): "
-            << zstdBytes.size() << " -> " << finalBytes.size() << " bytes\n";
+            << formatSize(zstdBytes.size()) << " -> " << formatSize(finalBytes.size()) << "\n";
 
-      std::cerr << "  Total: " << input.size() << " -> " << finalBytes.size()
-            << " bytes (ratio: "
-            << static_cast<double>(input.size()) / finalBytes.size() << "x)\n";
+      std::cerr << "  Total: " << formatSize(input.size()) << " -> " << formatSize(finalBytes.size())
+            << " (ratio: "
+            << static_cast<double>(input.size()) / finalBytes.size() << "x)"
+            << "  (" << outputFile << ")\n";
 
       writeAllBytes(outputFile, finalBytes);
       return 0;
@@ -507,12 +610,13 @@ int main(int argc, char* argv[]) {
       // Stage 1: Arithmetic decode
       std::vector<uint8_t> zstdBytes = arithmeticDecode(input);
       std::cerr << "  Stage 1 (Arithmetic decode): "
-            << input.size() << " -> " << zstdBytes.size() << " bytes\n";
+            << formatSize(input.size()) << " -> " << formatSize(zstdBytes.size()) << "\n";
 
       // Stage 2: Zstd decompress
       std::vector<uint8_t> original = decompressZstd(zstdBytes);
       std::cerr << "  Stage 2 (Zstd decompress): "
-            << zstdBytes.size() << " -> " << original.size() << " bytes\n";
+            << formatSize(zstdBytes.size()) << " -> " << formatSize(original.size())
+            << "  (" << outputFile << ")\n";
 
       writeAllBytes(outputFile, original);
       return 0;
@@ -526,3 +630,5 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 }
+
+
