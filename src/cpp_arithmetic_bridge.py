@@ -98,3 +98,6 @@ class ArithmeticCompressor:
     def decompress(self, data: bytes) -> bytes:
         """Decompress an arithmetic-coded byte buffer back to the original data."""
         return self._run_codec("d", data)
+
+        """Decompress an arithmetic-coded byte buffer back to the original data."""
+        return self._run_codec("d", data)
