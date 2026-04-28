@@ -328,23 +328,66 @@ void writeAllBytes(const std::string& path, const std::vector<uint8_t>& data) {
 
 // ── Main: Arithmetic codec CLI ───────────────────────────────────────────────
 
+namespace {
+
+/// Default file extension used for arithmetic-compressed output.
+constexpr const char* ART_EXTENSION = ".art";
+
+/// Returns true if *path* ends with the given suffix (case-sensitive).
+bool endsWith(const std::string& path, const std::string& suffix) {
+  return path.size() >= suffix.size() &&
+       path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+/// Derives the default compressed-output path by appending ".art" to *input*.
+std::string defaultCompressedPath(const std::string& input) {
+  return input + ART_EXTENSION;
+}
+
+/// Derives the default decompressed-output path by stripping ".art" from
+/// *input*.  If the input does not end in ".art", appends ".out" instead so
+/// the result is never the same as the input file.
+std::string defaultDecompressedPath(const std::string& input) {
+  if (endsWith(input, ART_EXTENSION)) {
+    return input.substr(0, input.size() - std::string(ART_EXTENSION).size());
+  }
+  return input + ".out";
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
-  if (argc != 4) {
+  // The output argument is optional:
+  //   - On compress:   default is <input>.art
+  //   - On decompress: default is <input> with ".art" stripped (or +".out")
+  if (argc < 3 || argc > 4) {
     std::cerr << "Arithmetic codec\n\n"
           << "Usage:\n"
-          << "  " << argv[0] << " <mode> <input> <output>\n\n"
+          << "  " << argv[0] << " <mode> <input> [output]\n\n"
           << "Modes:\n"
           << "  c, -c, -compress    Compress (Arithmetic encode)\n"
-          << "  d, -d, -decompress  Decompress (Arithmetic decode)\n";
+          << "  d, -d, -decompress  Decompress (Arithmetic decode)\n\n"
+          << "If [output] is omitted:\n"
+          << "  - compress writes to <input>.art\n"
+          << "  - decompress strips the trailing .art (or appends .out)\n";
     return 1;
   }
 
   const std::string mode       = argv[1];
   const std::string inputFile  = argv[2];
-  const std::string outputFile = argv[3];
 
   const bool doCompress   = (mode == "c" || mode == "-c" || mode == "-compress");
   const bool doDecompress = (mode == "d" || mode == "-d" || mode == "-decompress");
+
+  // Resolve output path: explicit arg wins, otherwise use the mode default.
+  std::string outputFile;
+  if (argc == 4) {
+    outputFile = argv[3];
+  } else if (doCompress) {
+    outputFile = defaultCompressedPath(inputFile);
+  } else if (doDecompress) {
+    outputFile = defaultDecompressedPath(inputFile);
+  }
 
   try {
     if (doCompress) {
@@ -353,7 +396,7 @@ int main(int argc, char* argv[]) {
       if (!out) throw std::runtime_error("Cannot open output file: " + outputFile);
       encode(inData, out);
       std::cerr << "  Arithmetic: " << inData.size() << " -> " << out.tellp()
-            << " bytes\n";
+            << " bytes  (" << outputFile << ")\n";
       return 0;
     }
 
@@ -362,7 +405,8 @@ int main(int argc, char* argv[]) {
       if (!in) throw std::runtime_error("Cannot open input file: " + inputFile);
       auto outData = decode(in);
       writeAllBytes(outputFile, outData);
-      std::cerr << "  Arithmetic decode: " << outData.size() << " bytes\n";
+      std::cerr << "  Arithmetic decode: " << outData.size()
+            << " bytes  (" << outputFile << ")\n";
       return 0;
     }
 
@@ -373,3 +417,4 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 }
+
