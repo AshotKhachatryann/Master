@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-// Zstd C API — declared directly so no zstd development headers are needed.
+// Zstd C API — declared directly, so no zstd development headers are needed.
 // Only requires libzstd runtime (.so/.dylib/.dll) at link and run time.
 extern "C" {
 size_t ZSTD_compress(void* dst, size_t dstCapacity,
@@ -120,33 +120,107 @@ std::vector<uint8_t> decompressZstd(const std::vector<uint8_t>& input) {
 
 // ── Main: Zstd codec CLI ────────────────────────────────────────────────────
 
-int main(int argc, char* argv[]) {
-  if (argc < 4 || argc > 5) {
-    std::cerr << "Zstd codec\n\n"
-          << "Usage:\n"
-          << "  " << argv[0] << " <mode> <input> <output> [zstdLevel]\n\n"
-          << "Modes:\n"
-          << "  c, -c, -compress    Compress (Zstd)\n"
-          << "  d, -d, -decompress  Decompress (Zstd)\n\n"
-          << "zstdLevel: 1 (fastest) to 22 (best ratio), default 3\n";
-    return 1;
-  }
+namespace {
 
-  const std::string mode       = argv[1];
-  const std::string inputFile  = argv[2];
-  const std::string outputFile = argv[3];
+/// Default file extension used for Zstd-compressed output.
+constexpr const char* ZST_EXTENSION = ".zst";
+
+/// Returns true if *path* ends with the given suffix (case-sensitive).
+bool endsWith(const std::string& path, const std::string& suffix) {
+  return path.size() >= suffix.size() &&
+       path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+/// Derives the default compressed-output path by appending ".zst" to *input*.
+std::string defaultCompressedPath(const std::string& input) {
+  return input + ZST_EXTENSION;
+}
+
+/// Derives the default decompressed-output path by stripping ".zst" from
+/// *input*.  If the input does not end in ".zst", appends ".out" instead so
+/// the result is never the same as the input file.
+std::string defaultDecompressedPath(const std::string& input) {
+  if (endsWith(input, ZST_EXTENSION)) {
+    return input.substr(0, input.size() - std::string(ZST_EXTENSION).size());
+  }
+  return input + ".out";
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+  // Pre-pass: extract -l/--level flag (with optional '=' form) from argv,
+  // leaving only positional args for the legacy parser below.  The flag
+  // may appear anywhere on the command line.
   int zstdLevel = 3;
-  if (argc == 5) {
-    zstdLevel = std::stoi(argv[4]);
+  std::vector<std::string> args;
+  args.reserve(argc);
+  args.emplace_back(argv[0]);
+
+  auto setLevel = [&](const std::string& v) -> bool {
+    try {
+      zstdLevel = std::stoi(v);
+    } catch (...) {
+      std::cerr << "Invalid zstdLevel value: '" << v << "'\n";
+      return false;
+    }
     if (zstdLevel < 1 || zstdLevel > 22) {
-      std::cerr << "Invalid zstdLevel: " << zstdLevel
-            << " (must be 1–22)\n";
-      return 1;
+      std::cerr << "Invalid zstdLevel: " << zstdLevel << " (must be 1–22)\n";
+      return false;
+    }
+    return true;
+  };
+
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "-l" || a == "--level") {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value for " << a << "\n";
+        return 1;
+      }
+      if (!setLevel(argv[++i])) return 1;
+    } else if (a.rfind("-l=", 0) == 0) {
+      if (!setLevel(a.substr(3))) return 1;
+    } else if (a.rfind("--level=", 0) == 0) {
+      if (!setLevel(a.substr(8))) return 1;
+    } else {
+      args.push_back(std::move(a));
     }
   }
 
+  // Positional contract after flag stripping:
+  //   args = [argv0, mode, input]            — output defaulted
+  //   args = [argv0, mode, input, output]    — explicit output
+  if (args.size() < 3 || args.size() > 4) {
+    std::cerr << "Zstd codec\n\n"
+          << "Usage:\n"
+          << "  " << argv[0] << " <mode> <input> [output] [-l N | --level N]\n\n"
+          << "Modes:\n"
+          << "  c, -c, -compress    Compress (Zstd)\n"
+          << "  d, -d, -decompress  Decompress (Zstd)\n\n"
+          << "If [output] is omitted:\n"
+          << "  - compress writes to <input>.zst\n"
+          << "  - decompress strips the trailing .zst (or appends .out)\n\n"
+          << "-l, --level: Zstd level 1 (fastest) to 22 (best ratio), default 3.\n"
+          << "             Accepts '-l 9', '-l=9', '--level 9', or '--level=9'.\n";
+    return 1;
+  }
+
+  const std::string mode       = args[1];
+  const std::string inputFile  = args[2];
+
   const bool doCompress   = (mode == "c" || mode == "-c" || mode == "-compress");
   const bool doDecompress = (mode == "d" || mode == "-d" || mode == "-decompress");
+
+  // Resolve output path: explicit arg wins, otherwise use the mode default.
+  std::string outputFile;
+  if (args.size() == 4) {
+    outputFile = args[3];
+  } else if (doCompress) {
+    outputFile = defaultCompressedPath(inputFile);
+  } else if (doDecompress) {
+    outputFile = defaultDecompressedPath(inputFile);
+  }
 
   try {
     auto input = readAllBytes(inputFile);
@@ -155,7 +229,7 @@ int main(int argc, char* argv[]) {
       auto out = compressZstd(input, zstdLevel);
       writeAllBytes(outputFile, out);
       std::cerr << "  Zstd L" << zstdLevel << ": " << input.size()
-            << " -> " << out.size() << " bytes\n";
+            << " -> " << out.size() << " bytes  (" << outputFile << ")\n";
       return 0;
     }
 
@@ -163,7 +237,7 @@ int main(int argc, char* argv[]) {
       auto out = decompressZstd(input);
       writeAllBytes(outputFile, out);
       std::cerr << "  Zstd decompress: " << input.size()
-            << " -> " << out.size() << " bytes\n";
+            << " -> " << out.size() << " bytes  (" << outputFile << ")\n";
       return 0;
     }
 
@@ -174,3 +248,4 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 }
+
