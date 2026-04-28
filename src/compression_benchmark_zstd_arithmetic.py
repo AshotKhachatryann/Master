@@ -25,6 +25,21 @@ from cpp_arithmetic_bridge import ArithmeticCompressor
 from cpp_zstd_bridge import ZstdCompressor
 
 
+def format_size(num_bytes: int, signed: bool = False) -> str:
+    """Render *num_bytes* using the largest unit that yields a value >= 1.
+
+    Picks GB → MB → KB → B (binary, 1024-based).  When *signed* is True
+    a leading '+' is shown for positive values (negatives always carry '-').
+    """
+    n = float(num_bytes)
+    fmt = "+.2f" if signed else ".2f"
+    for unit, threshold in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if abs(n) >= threshold:
+            return f"{n / threshold:{fmt}} {unit}"
+    int_fmt = "+d" if signed else "d"
+    return f"{int(num_bytes):{int_fmt}} B"
+
+
 class CompressionBenchmarkZstdArith:
     """Benchmark comparing Zstd-first pipeline approach.
 
@@ -150,18 +165,22 @@ class CompressionBenchmarkZstdArith:
     # ── Core benchmark driver ─────────────────────────────────────────────
 
     def _verify_round_trip(self, original: bytes, compressed: bytes,
-                            decompress_fn, method_name: str) -> None:
+                            decompress_fn, method_name: str) -> float:
         """Decompress *compressed* and assert it matches *original*.
+
+        Returns the decompression elapsed time in seconds so the caller
+        can record it alongside the compression time.
 
         Raises RuntimeError if the round-trip fails, so corrupt codecs
         are caught immediately rather than producing silent bad data.
         """
-        recovered, _ = decompress_fn(compressed)
+        recovered, elapsed = decompress_fn(compressed)
         if recovered != original:
             raise RuntimeError(
                 f"Round-trip verification FAILED for {method_name}: "
                 f"original {len(original)} bytes, recovered {len(recovered)} bytes"
             )
+        return elapsed
 
     def benchmark_on_data(self, data: bytes, label: str = "Unknown") -> dict:
         """Run all four compression methods on *data* and return a stats dict.
@@ -179,53 +198,57 @@ class CompressionBenchmarkZstdArith:
 
         # ── Method 1: Zstd only ──────────────────────────────────────────
         zstd_comp, zstd_time = self.compress_zstd_only(data)
-        self._verify_round_trip(data, zstd_comp,
-                                self.decompress_zstd_only, "zstd_only")
+        zstd_dec_time = self._verify_round_trip(
+            data, zstd_comp, self.decompress_zstd_only, "zstd_only")
         zstd_comp_size = len(zstd_comp)
         # Ratio >1 means data got smaller; 0 guards against empty output.
         zstd_ratio = original_size / zstd_comp_size if zstd_comp_size > 0 else 0
         stats["methods"]["zstd_only"] = {
             "compressed_size_bytes": zstd_comp_size,
             "compression_ratio": round(zstd_ratio, 4),
-            "compression_time_ms": round(zstd_time * 1000, 2)
+            "compression_time_s": round(zstd_time, 4),
+            "decompression_time_s": round(zstd_dec_time, 4),
         }
 
         # ── Method 2: Arithmetic only ────────────────────────────────────
         arith_comp, arith_time = self.compress_arithmetic_only(data)
-        self._verify_round_trip(data, arith_comp,
-                                self.decompress_arithmetic_only, "arithmetic_only")
+        arith_dec_time = self._verify_round_trip(
+            data, arith_comp, self.decompress_arithmetic_only, "arithmetic_only")
         arith_comp_size = len(arith_comp)
         arith_ratio = original_size / arith_comp_size if arith_comp_size > 0 else 0
         stats["methods"]["arithmetic_only"] = {
             "compressed_size_bytes": arith_comp_size,
             "compression_ratio": round(arith_ratio, 4),
-            "compression_time_ms": round(arith_time * 1000, 2)
+            "compression_time_s": round(arith_time, 4),
+            "decompression_time_s": round(arith_dec_time, 4),
         }
 
         # ── Method 3: Reverse pipeline (Zstd → Arithmetic) ──────────────
         rev_comp, rev_time = self.compress_reverse_pipeline_zstd_arith(data)
-        self._verify_round_trip(data, rev_comp,
-                                self.decompress_reverse_pipeline_zstd_arith,
-                                "reverse_pipeline_zstd_arith")
+        rev_dec_time = self._verify_round_trip(
+            data, rev_comp, self.decompress_reverse_pipeline_zstd_arith,
+            "reverse_pipeline_zstd_arith")
         rev_comp_size = len(rev_comp)
         rev_ratio = original_size / rev_comp_size if rev_comp_size > 0 else 0
         stats["methods"]["reverse_pipeline_zstd_arith"] = {
             "compressed_size_bytes": rev_comp_size,
             "compression_ratio": round(rev_ratio, 4),
-            "compression_time_ms": round(rev_time * 1000, 2)
+            "compression_time_s": round(rev_time, 4),
+            "decompression_time_s": round(rev_dec_time, 4),
         }
 
         # ── Method 4: Forward pipeline (Arithmetic → Zstd) ──────────────
         fwd_comp, fwd_time = self.compress_forward_pipeline_arith_zstd(data)
-        self._verify_round_trip(data, fwd_comp,
-                                self.decompress_forward_pipeline_arith_zstd,
-                                "forward_pipeline_arith_zstd")
+        fwd_dec_time = self._verify_round_trip(
+            data, fwd_comp, self.decompress_forward_pipeline_arith_zstd,
+            "forward_pipeline_arith_zstd")
         fwd_comp_size = len(fwd_comp)
         fwd_ratio = original_size / fwd_comp_size if fwd_comp_size > 0 else 0
         stats["methods"]["forward_pipeline_arith_zstd"] = {
             "compressed_size_bytes": fwd_comp_size,
             "compression_ratio": round(fwd_ratio, 4),
-            "compression_time_ms": round(fwd_time * 1000, 2)
+            "compression_time_s": round(fwd_time, 4),
+            "decompression_time_s": round(fwd_dec_time, 4),
         }
 
         # ── Winner selection ─────────────────────────────────────────────
@@ -322,13 +345,28 @@ class CompressionBenchmarkZstdArith:
 
         for result in results_list:
             report.append(f"Test: {result['label']}")
-            report.append(f"Original Size: {result['original_size_bytes']:,} bytes")
+            report.append(f"Original Size: {format_size(result['original_size_bytes'])} ({result['original_size_bytes']:,} bytes)")
             report.append("")
 
-            # Create comparison table
-            report.append("┌─────────────────────────────┬─────────────────┬──────────────────┬────────────────────┬─────────────────────┐")
-            report.append("│ Compression Method          │ Compressed Size │ Compression Ratio│ Time (ms)          │ Size vs Zstd-only   │")
-            report.append("├─────────────────────────────┼─────────────────┼──────────────────┼────────────────────┼─────────────────────┤")
+            # Column inner widths (must match header labels and row data formats).
+            # Each cell is rendered as: " " + value(width=W) + " ", so the border
+            # segment is W+2 box-drawing characters wide.
+            W_NAME, W_SIZE, W_RATIO, W_CT, W_DT, W_DELTA = 27, 15, 17, 14, 16, 26
+            h = "─"
+            top    = f"┌{h*(W_NAME+2)}┬{h*(W_SIZE+2)}┬{h*(W_RATIO+2)}┬{h*(W_CT+2)}┬{h*(W_DT+2)}┬{h*(W_DELTA+2)}┐"
+            mid    = f"├{h*(W_NAME+2)}┼{h*(W_SIZE+2)}┼{h*(W_RATIO+2)}┼{h*(W_CT+2)}┼{h*(W_DT+2)}┼{h*(W_DELTA+2)}┤"
+            bottom = f"└{h*(W_NAME+2)}┴{h*(W_SIZE+2)}┴{h*(W_RATIO+2)}┴{h*(W_CT+2)}┴{h*(W_DT+2)}┴{h*(W_DELTA+2)}┘"
+
+            report.append(top)
+            report.append(
+                f"│ {'Compression Method':<{W_NAME}} "
+                f"│ {'Compressed Size':<{W_SIZE}} "
+                f"│ {'Compression Ratio':<{W_RATIO}} "
+                f"│ {'Compress (s)':<{W_CT}} "
+                f"│ {'Decompress (s)':<{W_DT}} "
+                f"│ {'Size vs Zstd-only':<{W_DELTA}} │"
+            )
+            report.append(mid)
 
             methods = ["zstd_only", "arithmetic_only", "reverse_pipeline_zstd_arith", "forward_pipeline_arith_zstd"]
             method_labels = ["Zstd Only", "Arithmetic Only", "Zstd->Arithmetic Pipeline", "Arithmetic->Zstd Pipeline"]
@@ -339,7 +377,8 @@ class CompressionBenchmarkZstdArith:
                 data = result['methods'][method]
                 size = data['compressed_size_bytes']
                 ratio = data['compression_ratio']
-                time_ms = data['compression_time_ms']
+                ct_s = data['compression_time_s']
+                dt_s = data['decompression_time_s']
 
                 # Calculate delta vs zstd
                 if method == "zstd_only":
@@ -347,11 +386,19 @@ class CompressionBenchmarkZstdArith:
                 else:
                     delta = size - zstd_size
                     delta_pct = (delta / zstd_size * 100) if zstd_size > 0 else 0
-                    delta_str = f"{delta:+,} bytes ({delta_pct:+.2f}%)"
+                    delta_str = f"{format_size(delta, signed=True)} ({delta_pct:+.2f}%)"
 
-                report.append(f"│ {label:<27} │ {size:>14,} │ {ratio:>16.4f} │ {time_ms:>18.2f} │ {delta_str:>19} │")
+                size_str = format_size(size)
+                report.append(
+                    f"│ {label:<{W_NAME}} "
+                    f"│ {size_str:>{W_SIZE}} "
+                    f"│ {ratio:>{W_RATIO}.4f} "
+                    f"│ {ct_s:>{W_CT}.4f} "
+                    f"│ {dt_s:>{W_DT}.4f} "
+                    f"│ {delta_str:>{W_DELTA}} │"
+                )
 
-            report.append("└─────────────────────────────┴─────────────────┴──────────────────┴────────────────────┴─────────────────────┘")
+            report.append(bottom)
             report.append("")
 
             # Summary
@@ -385,7 +432,7 @@ class CompressionBenchmarkZstdArith:
 
         for result in results_list:
             report.append(f"Test: {result['label']}")
-            report.append(f"Original size: {result['original_size_bytes']:,} bytes")
+            report.append(f"Original size: {format_size(result['original_size_bytes'])} ({result['original_size_bytes']:,} bytes)")
             report.append("")
 
             # ── Single-pass results ──────────────────────────────────────
@@ -394,9 +441,10 @@ class CompressionBenchmarkZstdArith:
                 if method in result['methods']:
                     data = result['methods'][method]
                     report.append(f"    {method.upper().replace('_', ' ')}")
-                    report.append(f"      Compressed size: {data['compressed_size_bytes']:,} bytes")
+                    report.append(f"      Compressed size: {format_size(data['compressed_size_bytes'])} ({data['compressed_size_bytes']:,} bytes)")
                     report.append(f"      Compression ratio: {data['compression_ratio']:.4f}x")
-                    report.append(f"      Time: {data['compression_time_ms']} ms")
+                    report.append(f"      Compress time:   {data['compression_time_s']:.4f} s")
+                    report.append(f"      Decompress time: {data['decompression_time_s']:.4f} s")
 
             # ── Pipeline results ─────────────────────────────────────────
             report.append("")
@@ -408,9 +456,10 @@ class CompressionBenchmarkZstdArith:
                 if pipe_method in result['methods']:
                     data = result['methods'][pipe_method]
                     report.append(f"    {pipe_label}:")
-                    report.append(f"      Compressed size: {data['compressed_size_bytes']:,} bytes")
+                    report.append(f"      Compressed size: {format_size(data['compressed_size_bytes'])} ({data['compressed_size_bytes']:,} bytes)")
                     report.append(f"      Compression ratio: {data['compression_ratio']:.4f}x")
-                    report.append(f"      Time: {data['compression_time_ms']} ms")
+                    report.append(f"      Compress time:   {data['compression_time_s']:.4f} s")
+                    report.append(f"      Decompress time: {data['decompression_time_s']:.4f} s")
 
             report.append("")
             report.append(f"  BEST OVERALL: {result['best_method'].upper().replace('_', ' ')} ({result['best_ratio']:.4f}x)")
@@ -419,11 +468,11 @@ class CompressionBenchmarkZstdArith:
             # ── Delta analysis ───────────────────────────────────────────
             report.append("  DELTA ANALYSIS (Reverse Pipeline Impact):")
             delta = result['delta_analysis']
-            report.append(f"    vs Zstd-only:      {delta['reverse_vs_zstd_bytes']:+,} bytes ({delta['reverse_vs_zstd_percent']:+.2f}%)")
-            report.append(f"    vs Arithmetic-only: {delta['reverse_vs_arithmetic_bytes']:+,} bytes ({delta['reverse_vs_arithmetic_percent']:+.2f}%)")
-            report.append(f"    Zstd vs Arithmetic: {delta['zstd_vs_arithmetic_bytes']:+,} bytes ({delta['zstd_vs_arithmetic_percent']:+.2f}%)")
-            report.append(f"    Forward vs Zstd:    {delta['forward_vs_zstd_bytes']:+,} bytes ({delta['forward_vs_zstd_percent']:+.2f}%)")
-            report.append(f"    Forward vs Reverse: {delta['forward_vs_reverse_bytes']:+,} bytes ({delta['forward_vs_reverse_percent']:+.2f}%)")
+            report.append(f"    vs Zstd-only:      {format_size(delta['reverse_vs_zstd_bytes'], signed=True)} ({delta['reverse_vs_zstd_percent']:+.2f}%)")
+            report.append(f"    vs Arithmetic-only: {format_size(delta['reverse_vs_arithmetic_bytes'], signed=True)} ({delta['reverse_vs_arithmetic_percent']:+.2f}%)")
+            report.append(f"    Zstd vs Arithmetic: {format_size(delta['zstd_vs_arithmetic_bytes'], signed=True)} ({delta['zstd_vs_arithmetic_percent']:+.2f}%)")
+            report.append(f"    Forward vs Zstd:    {format_size(delta['forward_vs_zstd_bytes'], signed=True)} ({delta['forward_vs_zstd_percent']:+.2f}%)")
+            report.append(f"    Forward vs Reverse: {format_size(delta['forward_vs_reverse_bytes'], signed=True)} ({delta['forward_vs_reverse_percent']:+.2f}%)")
             report.append("")
 
             # ── Viability verdicts ────────────────────────────────────────
@@ -485,10 +534,10 @@ def main():
         with open(wav_file, 'rb') as f:
             wav_data = f.read()
 
-        print(f"WAV file size: {len(wav_data):,} bytes")
+        print(f"WAV file size: {format_size(len(wav_data))} ({len(wav_data):,} bytes)")
         print("Running compression benchmark...")
 
-        result = benchmark.benchmark_on_data(wav_data, f"WAV Audio File ({len(wav_data):,} bytes)")
+        result = benchmark.benchmark_on_data(wav_data, f"WAV Audio File ({format_size(len(wav_data))})")
         results.append(result)
     else:
         print(f"WAV file not found: {wav_file}")
