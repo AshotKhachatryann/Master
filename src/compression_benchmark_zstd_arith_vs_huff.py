@@ -9,9 +9,9 @@ same input data and produces a side-by-side report plus JSON:
   2. Zstd → Huffman     — LZ first, then entropy (Huffman) coder
 
 Both pipelines are round-trip verified.  The delta section shows
-which second-stage entropy coder squeezes Zstd output better.
+Which second-stage entropy coder squeezes Zstd output better?
 
-Compression engines are in C++; this script is Python benchmark
+Compression engines are in C++; this script is a Python benchmark
 orchestration using the project-local bridge modules.
 """
 
@@ -27,6 +27,21 @@ from pathlib import Path
 from cpp_arithmetic_bridge import ArithmeticCompressor
 from cpp_huffman_bridge import HuffmanCompressor
 from cpp_zstd_bridge import ZstdCompressor
+
+
+def format_size(num_bytes: int, signed: bool = False) -> str:
+    """Render *num_bytes* using the largest unit that yields a value >= 1.
+
+    Picks GB → MB → KB → B (binary, 1024-based).  When *signed* is True
+    a leading '+' is shown for positive values (negatives always carry '-').
+    """
+    n = float(num_bytes)
+    fmt = "+.2f" if signed else ".2f"
+    for unit, threshold in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if abs(n) >= threshold:
+            return f"{n / threshold:{fmt}} {unit}"
+    int_fmt = "+d" if signed else "d"
+    return f"{int(num_bytes):{int_fmt}} B"
 
 
 class PipelineComparisonBenchmark:
@@ -114,14 +129,14 @@ class PipelineComparisonBenchmark:
                 "zstd_arithmetic": {
                     "compressed_size_bytes": arith_size,
                     "compression_ratio": round(arith_ratio, 4),
-                    "compression_time_ms": round(arith_ct * 1000, 2),
-                    "decompression_time_ms": round(arith_dt * 1000, 2),
+                    "compression_time_s": round(arith_ct, 4),
+                    "decompression_time_s": round(arith_dt, 4),
                 },
                 "zstd_huffman": {
                     "compressed_size_bytes": huff_size,
                     "compression_ratio": round(huff_ratio, 4),
-                    "compression_time_ms": round(huff_ct * 1000, 2),
-                    "decompression_time_ms": round(huff_dt * 1000, 2),
+                    "compression_time_s": round(huff_ct, 4),
+                    "decompression_time_s": round(huff_dt, 4),
                 },
             },
             "delta": {
@@ -138,23 +153,42 @@ def print_table(result: dict) -> None:
     print("CUSTOM PIPELINE COMPARISON: ZSTD+ARITHMETIC vs ZSTD+HUFFMAN")
     print("=" * 116)
     print(f"Test: {result['label']}")
-    print(f"Original Size: {result['original_size_bytes']:,} bytes")
+    print(f"Original Size: {format_size(result['original_size_bytes'])} ({result['original_size_bytes']:,} bytes)")
     print()
-    print("┌──────────────────────────┬─────────────────┬──────────────────┬────────────────────┬──────────────────────┐")
-    print("│ Pipeline                 │ Compressed Size │ Compression Ratio│ Compress Time (ms) │ Decompress Time (ms) │")
-    print("├──────────────────────────┼─────────────────┼──────────────────┼────────────────────┼──────────────────────┤")
+
+    # Column inner widths (must match header labels and row data formats).
+    # Each cell is rendered as: " " + value(width=W) + " ", so the border
+    # segment is W+2 box-drawing characters wide.
+    W_NAME, W_SIZE, W_RATIO, W_CT, W_DT = 24, 32, 18, 20, 22
+    h = "─"
+    top    = f"┌{h*(W_NAME+2)}┬{h*(W_SIZE+2)}┬{h*(W_RATIO+2)}┬{h*(W_CT+2)}┬{h*(W_DT+2)}┐"
+    mid    = f"├{h*(W_NAME+2)}┼{h*(W_SIZE+2)}┼{h*(W_RATIO+2)}┼{h*(W_CT+2)}┼{h*(W_DT+2)}┤"
+    bottom = f"└{h*(W_NAME+2)}┴{h*(W_SIZE+2)}┴{h*(W_RATIO+2)}┴{h*(W_CT+2)}┴{h*(W_DT+2)}┘"
+
+    print(top)
+    print(f"│ {'Pipeline':<{W_NAME}} │ {'Compressed Size':<{W_SIZE}} │ {'Compression Ratio':<{W_RATIO}} │ {'Compress Time (s)':<{W_CT}} │ {'Decompress Time (s)':<{W_DT}} │")
+    print(mid)
 
     m1 = result["methods"]["zstd_arithmetic"]
     m2 = result["methods"]["zstd_huffman"]
 
-    print(f"│ {'Zstd+Arithmetic':<24} │ {m1['compressed_size_bytes']:>14,} │ {m1['compression_ratio']:>16.4f} │ {m1['compression_time_ms']:>18.2f} │ {m1['decompression_time_ms']:>20.2f} │")
-    print(f"│ {'Zstd+Huffman':<24}    │ {m2['compressed_size_bytes']:>14,} │ {m2['compression_ratio']:>16.4f} │ {m2['compression_time_ms']:>18.2f} │ {m2['decompression_time_ms']:>20.2f} │")
-    print("└──────────────────────────┴─────────────────┴──────────────────┴────────────────────┴──────────────────────┘")
+    for label, m in (("Zstd+Arithmetic", m1), ("Zstd+Huffman", m2)):
+        # Format size with the largest unit that fits (GB/MB/KB/B),
+        # plus the exact byte count for unambiguous comparison.
+        size_str = f"{format_size(m['compressed_size_bytes'])} ({m['compressed_size_bytes']:,} B)"
+        print(
+            f"│ {label:<{W_NAME}} "
+            f"│ {size_str:>{W_SIZE}} "
+            f"│ {m['compression_ratio']:>{W_RATIO}.4f} "
+            f"│ {m['compression_time_s']:>{W_CT}.4f} "
+            f"│ {m['decompression_time_s']:>{W_DT}.4f} │"
+        )
+    print(bottom)
 
     d = result["delta"]
     print()
     print("Delta (Zstd+Huffman - Zstd+Arithmetic):")
-    print(f"  Size:  {d['huffman_minus_arithmetic_bytes']:+,} bytes ({d['huffman_minus_arithmetic_percent']:+.2f}%)")
+    print(f"  Size:  {format_size(d['huffman_minus_arithmetic_bytes'], signed=True)} ({d['huffman_minus_arithmetic_percent']:+.2f}%)")
     print(f"  Ratio: {d['ratio_huffman_minus_arithmetic']:+.4f}x")
     print(f"Best Method: {result['best_method']}")
     print("=" * 116)
@@ -188,9 +222,9 @@ def main() -> None:
     if wav.exists():
         print(f"Reading WAV file: {wav}")
         data = wav.read_bytes()
-        print(f"WAV file size: {len(data):,} bytes")
+        print(f"WAV file size: {format_size(len(data))} ({len(data):,} bytes)")
         print("Running pipeline comparison benchmark...")
-        result = bench.run(data, f"WAV Audio File ({len(data):,} bytes)")
+        result = bench.run(data, f"WAV Audio File ({format_size(len(data))})")
     else:
         print(f"WAV file not found: {wav}")
         print("Using synthetic test data instead...")
